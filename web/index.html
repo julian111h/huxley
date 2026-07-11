@@ -1,0 +1,79 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <title>Huxley</title>
+  <link rel="stylesheet" href="/static/huxley.css" />
+</head>
+<body>
+  <div id="app">
+    <div id="topbar">
+      <div id="wordmark">Huxley<span class="dot">.</span></div>
+      <div id="topbar-right">
+        <span id="filename"></span>
+        <span id="compile-status" class="idle">idle</span>
+        <button id="settings-btn" title="Settings">&#9881;</button>
+        <button id="compile-btn">Compile</button>
+      </div>
+    </div>
+    <div id="main">
+      <div id="sidebar">
+        <div id="sidebar-header">
+          <span id="sidebar-title">Files</span>
+          <button id="sidebar-toggle" title="Collapse">&laquo;</button>
+        </div>
+        <button id="open-folder-btn">Open Folder&hellip;</button>
+        <div id="file-tree"></div>
+      </div>
+      <div id="editor-pane"></div>
+      <div id="resizer"></div>
+      <div id="pdf-pane">
+        <div id="pdf-empty">Compile to see your PDF here.</div>
+      </div>
+    </div>
+    <div id="log-resizer"></div>
+    <div id="log-panel">
+      <div id="diagnostics-list"></div>
+      <textarea id="raw-log" readonly spellcheck="false"></textarea>
+    </div>
+  </div>
+
+  <div id="settings-overlay">
+    <div id="settings-modal">
+      <div id="settings-header">
+        <span>Settings</span>
+        <button id="settings-close" title="Close">&times;</button>
+      </div>
+      <div id="settings-body">
+        <label class="settings-field">
+          <span>AI base URL</span>
+          <input id="setting-base-url" type="text" placeholder="http://localhost:11434/v1" />
+        </label>
+        <label class="settings-field">
+          <span>Chat / explain model</span>
+          <div id="setting-chat-model"></div>
+        </label>
+        <label class="settings-field">
+          <span>Autocomplete model <span class="settings-hint">(use a small, fast, non-reasoning model)</span></span>
+          <div id="setting-autocomplete-model"></div>
+        </label>
+        <button id="settings-refresh-models" type="button">Refresh model list</button>
+        <label class="settings-toggle-row">
+          <input id="setting-autocomplete-enabled" type="checkbox" />
+          <span>Ghost-text autocomplete</span>
+        </label>
+        <label class="settings-toggle-row">
+          <input id="setting-grammar-enabled" type="checkbox" />
+          <span>Grammar checking (LanguageTool)</span>
+        </label>
+        <div id="settings-status"></div>
+      </div>
+      <div id="settings-footer">
+        <button id="settings-save">Save</button>
+      </div>
+    </div>
+  </div>
+
+  <script type="module" src="/static/editor.js"></script>
+</body>
+</html>
