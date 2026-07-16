@@ -5,7 +5,7 @@ timeouts, no cloud, no telemetry. Everything runs on your machine, including
 the optional AI features, which talk only to a local model server you point
 it at (e.g. [Ollama](https://ollama.com)).
 
-![Screenshot](huxley/samples/figures/20260711_155419.png)
+![Screenshot](samples/figures/20260711_155419.png)
 
 ## Features
 
