@@ -1,6 +1,6 @@
 import {
   EditorState, EditorView, keymap, lineNumbers, highlightActiveLine, highlightActiveLineGutter,
-  defaultKeymap, history, historyKeymap, indentWithTab,
+  defaultKeymap, history, historyKeymap, indentWithTab, undo, redo,
   searchKeymap, highlightSelectionMatches,
   closeBrackets, closeBracketsKeymap,
   StreamLanguage, syntaxHighlighting, HighlightStyle, tags, stex,
@@ -50,6 +50,7 @@ let view = null;
 let currentPath = null;
 let mainFilePath = null;
 let pdfPages = []; // index i -> canvas for page i+1, populated by renderPdf()
+let savedContent = null; // content of currentPath as of the last successful save/load
 
 function setStatus(text, cls) {
   statusEl.textContent = text;
@@ -65,6 +66,7 @@ function makeEditor(content) {
     doc: content,
     extensions: [
       lineNumbers(),
+      EditorView.lineWrapping,
       history(),
       highlightActiveLine(),
       highlightActiveLineGutter(),
@@ -90,6 +92,8 @@ function makeEditor(content) {
         if (update.docChanged) {
           scheduleGrammarCheck();
           scheduleGhostCheck(update.transactions.some((tr) => tr.isUserEvent("input.type")));
+          scheduleAutosave();
+          updateDirtyIndicator();
         } else if (update.selectionSet) {
           clearGhost(update.view);
         }
@@ -99,7 +103,39 @@ function makeEditor(content) {
   return new EditorView({ state, parent: document.getElementById("editor-pane") });
 }
 
+let pdfRenderInFlight = false;
+let pdfRenderPending = false;
+
+// A single Compile click can produce two "ok" broadcasts (the file watcher
+// and the explicit compile call both fire for the same save — see
+// compiler.py's -g comment). Without this guard, two overlapping renders
+// clobber each other's scroll-position capture/restore. A plain "skip if
+// busy" would risk dropping a genuinely newer render in rarer cases, so
+// instead: skip starting a second one concurrently, but queue exactly one
+// follow-up pass to run right after, which converges on the latest state.
 async function renderPdf() {
+  if (pdfRenderInFlight) {
+    pdfRenderPending = true;
+    return;
+  }
+  pdfRenderInFlight = true;
+  try {
+    await renderPdfNow();
+  } finally {
+    pdfRenderInFlight = false;
+    if (pdfRenderPending) {
+      pdfRenderPending = false;
+      renderPdf();
+    }
+  }
+}
+
+async function renderPdfNow() {
+  // Preserve the reader's position across recompiles — rebuilding the pane
+  // below resets scroll to 0 otherwise, which is disorienting on every save.
+  const scrollTop = pdfPane.scrollTop;
+  const scrollLeft = pdfPane.scrollLeft;
+
   // WebKitGTK's module-worker handshake is unreliable here, so render on the main thread.
   const doc = await pdfjsLib.getDocument({ url: "/api/pdf", disableWorker: true }).promise;
   pdfPane.innerHTML = "";
@@ -116,6 +152,14 @@ async function renderPdf() {
     pdfPages.push(canvas);
     await page.render({ canvasContext: canvas.getContext("2d"), viewport }).promise;
   }
+
+  // Deferred a frame: right after the loop, the browser may not have
+  // finished laying out the newly-inserted canvases yet, so scrollHeight is
+  // still its old (smaller) value and the assignment below would get clamped.
+  requestAnimationFrame(() => {
+    pdfPane.scrollTop = scrollTop;
+    pdfPane.scrollLeft = scrollLeft;
+  });
 }
 
 async function handlePdfClick(pageNumber, canvas, event) {
@@ -165,13 +209,53 @@ async function forwardSearchAt(line) {
   flashPdfHighlight(canvas, x, y, width, height);
 }
 
+let autosaveDebounceTimer = null;
+
+function isDirty() {
+  return currentPath !== null && view.state.doc.toString() !== savedContent;
+}
+
+function updateDirtyIndicator() {
+  filenameEl.classList.toggle("dirty", isDirty());
+}
+
+// The single path that ever writes editor content to disk. Always saves
+// whatever is *currently* open before anything is allowed to replace it —
+// switching files, switching projects, and compiling all funnel through
+// this so unsaved work is never silently discarded.
+async function saveCurrentFile() {
+  clearTimeout(autosaveDebounceTimer);
+  if (!isDirty()) return;
+  const path = currentPath;
+  const content = view.state.doc.toString();
+  await fetch("/api/save", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ path, content }),
+  });
+  // Only clear dirty state if nothing changed (and we're still on the same
+  // file) while the save was in flight.
+  if (currentPath === path && view.state.doc.toString() === content) {
+    savedContent = content;
+    updateDirtyIndicator();
+  }
+}
+
+function scheduleAutosave() {
+  clearTimeout(autosaveDebounceTimer);
+  autosaveDebounceTimer = setTimeout(saveCurrentFile, 1500);
+}
+
 async function openFile(path) {
+  await saveCurrentFile();
   const res = await fetch(`/api/file?path=${encodeURIComponent(path)}`);
   if (!res.ok) return;
   const { content } = await res.json();
   currentPath = path;
+  savedContent = content;
   filenameEl.textContent = path.split("/").pop();
   setDoc(content);
+  updateDirtyIndicator();
   for (const row of fileTreeEl.querySelectorAll(".tree-row.active")) row.classList.remove("active");
   const row = fileTreeEl.querySelector(`.tree-row[data-path="${CSS.escape(path)}"]`);
   if (row) row.classList.add("active");
@@ -186,7 +270,11 @@ function scheduleGrammarCheck() {
 
 async function runGrammarCheck() {
   const settings = getSettings();
-  if (!settings || !settings.grammar_enabled || currentPath === null) {
+  // .sty/.cls/.bib/etc are LaTeX code or structured data, not prose — even
+  // with markup stripped, checking them mostly just flags package/command
+  // names as typos.
+  const isProse = currentPath !== null && currentPath.endsWith(".tex");
+  if (!settings || !settings.grammar_enabled || !isProse) {
     clearGrammarMatches(view);
     return;
   }
@@ -202,31 +290,109 @@ async function runGrammarCheck() {
   if (view.state.doc.toString() === text) applyGrammarMatches(view, text, matches);
 }
 
+const GHOST_DEBOUNCE_MS = 400; // spec range: 300-500ms
+const GHOST_MIN_DOC_LENGTH = 20;
+// Cursor mid-command-name ("\sectio|"), or inside an unterminated
+// \cite{...}/\label{...}-style reference argument — completions there are
+// almost never useful and often actively wrong.
+const GHOST_MIDCOMMAND_RE = /\\[a-zA-Z]*$/;
+const GHOST_OPEN_REF_RE = /\\(cite\w*|label|ref|eqref|pageref|autoref)\*?\s*\{[^{}]*$/;
+
 let ghostDebounceTimer = null;
+let ghostAbortController = null;
+let ghostCache = { prefix: null, completion: null };
+
+function isGhostSuppressed(prefix, docLength) {
+  return docLength < GHOST_MIN_DOC_LENGTH || GHOST_MIDCOMMAND_RE.test(prefix) || GHOST_OPEN_REF_RE.test(prefix);
+}
+
+// Ghost text should never look like it's glued onto the end of the current
+// word — insert exactly one separating space unless one's already there.
+function formatGhostText(prefix, text) {
+  if (!text) return text;
+  const trimmed = text.replace(/^\s+/, "");
+  const lastChar = prefix.slice(-1);
+  const needsSpace = lastChar !== "" && !/\s/.test(lastChar);
+  return needsSpace ? ` ${trimmed}` : trimmed;
+}
 
 function scheduleGhostCheck(isUserTyping) {
-  clearGhost(view);
+  // Note: no unconditional clearGhost() here — ghostField's own update()
+  // already reacted to this same transaction (shrinking the ghost if the
+  // user typed a matching prefix of it, clearing it otherwise). Clearing
+  // again here would stomp on a legitimately "consumed" remainder.
   clearTimeout(ghostDebounceTimer);
+  if (ghostAbortController) {
+    ghostAbortController.abort();
+    ghostAbortController = null;
+  }
   if (!isUserTyping) return;
   const settings = getSettings();
-  if (!settings || !settings.autocomplete_enabled) return;
-  if (!view.state.selection.main.empty) return;
+  if (!settings || !settings.autocomplete_enabled) {
+    clearGhost(view);
+    return;
+  }
+  if (!view.state.selection.main.empty) {
+    clearGhost(view);
+    return;
+  }
   const pos = view.state.selection.main.head;
-  ghostDebounceTimer = setTimeout(() => runGhostCheck(pos), 500);
+  ghostDebounceTimer = setTimeout(() => runGhostCheck(pos), GHOST_DEBOUNCE_MS);
 }
 
 async function runGhostCheck(pos) {
   if (view.state.selection.main.head !== pos) return;
   const docText = view.state.doc.toString();
-  const res = await fetch("/api/ai/complete", {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ prefix: docText.slice(0, pos), suffix: docText.slice(pos) }),
-  });
-  if (!res.ok) return;
-  const { completion } = await res.json();
-  if (!completion || view.state.selection.main.head !== pos) return;
-  showGhost(view, pos, completion);
+  const prefix = docText.slice(0, pos);
+  const suffix = docText.slice(pos);
+
+  if (isGhostSuppressed(prefix, docText.length)) return;
+
+  if (ghostCache.prefix === prefix && ghostCache.completion) {
+    showGhost(view, pos, formatGhostText(prefix, ghostCache.completion));
+    return;
+  }
+
+  if (ghostAbortController) ghostAbortController.abort();
+  const controller = new AbortController();
+  ghostAbortController = controller;
+
+  let accumulated = "";
+  try {
+    const res = await fetch("/api/ai/complete", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ prefix, suffix }),
+      signal: controller.signal,
+    });
+    if (!res.ok || !res.body) return;
+    const reader = res.body.getReader();
+    const decoder = new TextDecoder();
+    while (true) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      if (view.state.selection.main.head !== pos) {
+        reader.cancel();
+        return;
+      }
+      accumulated += decoder.decode(value, { stream: true });
+      // Display incrementally as tokens arrive; stop naturally at the first
+      // newline even if the model keeps generating past one sentence.
+      showGhost(view, pos, formatGhostText(prefix, accumulated.split("\n")[0]));
+    }
+  } catch (err) {
+    if (err.name === "AbortError") return;
+  } finally {
+    if (ghostAbortController === controller) ghostAbortController = null;
+  }
+
+  const completion = accumulated.split("\n")[0].trim();
+  if (!completion || view.state.selection.main.head !== pos) {
+    clearGhost(view);
+    return;
+  }
+  ghostCache = { prefix, completion };
+  showGhost(view, pos, formatGhostText(prefix, completion));
 }
 
 async function jumpToLine(file, line) {
@@ -253,7 +419,13 @@ function renderDiagnostics(diagnostics, rawLog) {
   }
 
   logPanel.classList.toggle("error", diagnostics.some((d) => d.severity === "error"));
-  rawLogEl.value = rawLog || "";
+
+  // Show the focused excerpt around each diagnostic rather than the whole
+  // transcript (package loading, latexmk's own bookkeeping, etc). Only fall
+  // back to the full raw log when nothing could be parsed out of it.
+  rawLogEl.value = diagnostics.length > 0
+    ? diagnostics.map((d) => d.context || d.message).join("\n\n")
+    : rawLog || "";
 
   for (const diagnostic of diagnostics) {
     const row = document.createElement("div");
@@ -283,7 +455,7 @@ function renderDiagnostics(diagnostics, rawLog) {
     explainBtn.textContent = "✨ Explain";
     explainBtn.addEventListener("click", (event) => {
       event.stopPropagation();
-      explainDiagnostic(diagnostic, rawLog, explainBtn, row);
+      explainDiagnostic(diagnostic, explainBtn, row);
     });
     row.appendChild(explainBtn);
 
@@ -292,7 +464,7 @@ function renderDiagnostics(diagnostics, rawLog) {
   }
 }
 
-async function explainDiagnostic(diagnostic, rawLog, button, row) {
+async function explainDiagnostic(diagnostic, button, row) {
   const existing = row.nextElementSibling;
   if (existing && existing.classList.contains("diag-explanation")) {
     existing.remove();
@@ -306,7 +478,7 @@ async function explainDiagnostic(diagnostic, rawLog, button, row) {
     const res = await fetch("/api/ai/explain", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ message: diagnostic.message, log: rawLog || "" }),
+      body: JSON.stringify({ message: diagnostic.message, log: diagnostic.context || "" }),
     });
     const data = await res.json();
     box.textContent = res.ok ? data.explanation : data.detail || "Could not get an explanation.";
@@ -346,11 +518,7 @@ async function handleImprove(text, from, to) {
 
 async function compile() {
   if (currentPath === null) return;
-  await fetch("/api/save", {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ path: currentPath, content: view.state.doc.toString() }),
-  });
+  await saveCurrentFile();
   await fetch("/api/compile", { method: "POST" });
 }
 
@@ -359,9 +527,14 @@ function connectStatusSocket() {
   ws.addEventListener("message", (event) => {
     const msg = JSON.parse(event.data);
     if (msg.status === "compiling") {
+      // Deliberately leave the diagnostics panel showing the previous
+      // result rather than clearing it here: hiding it now and showing it
+      // again moments later (once the new result arrives) causes a layout
+      // shift that grows the PDF pane's height for that instant — long
+      // enough for the browser to clamp its scrollTop, permanently losing
+      // the reader's position even though we try to restore it afterward.
       compileBtn.disabled = true;
       setStatus("compiling…", "running");
-      renderDiagnostics([], "");
     } else if (msg.status === "ok") {
       compileBtn.disabled = false;
       setStatus("ok", "ok");
@@ -456,6 +629,25 @@ async function createFileIn(dirPath) {
   if (dirPath) expandedDirs.add(dirPath);
   await refreshTree();
   await openFile(fullPath);
+}
+
+async function createFolderIn(dirPath) {
+  const name = await showPrompt(dirPath ? `New folder in ${dirPath}/:` : "New folder:", "untitled");
+  if (!name) return;
+  const fullPath = dirPath ? `${dirPath}/${name}` : name;
+  const res = await fetch("/api/folder/create", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ path: fullPath }),
+  });
+  const data = await res.json();
+  if (!res.ok) {
+    await showAlert(data.detail || "Could not create folder.");
+    return;
+  }
+  if (dirPath) expandedDirs.add(dirPath);
+  expandedDirs.add(fullPath);
+  await refreshTree();
 }
 
 let activeContextMenu = null;
@@ -558,6 +750,7 @@ async function renderTreeInto(container, dirPath) {
         event.preventDefault();
         showContextMenu(event.clientX, event.clientY, [
           { label: "New File", action: () => createFileIn(entry.path) },
+          { label: "New Folder", action: () => createFolderIn(entry.path) },
           { label: "Rename", action: () => renameEntry(entry) },
           { label: "Delete", danger: true, action: () => deleteEntry(entry) },
         ]);
@@ -581,6 +774,13 @@ async function openFolderDialog() {
   if (!window.pywebview) return;
   const path = await window.pywebview.api.open_folder();
   if (!path) return;
+  // Flush any pending edits to the project we're leaving *before* the server
+  // switches root — saving after would write against the new project's root
+  // instead, silently losing the edit (or worse, hitting a same-named file
+  // in the new project).
+  await saveCurrentFile();
+  currentPath = null;
+  savedContent = null;
   await fetch("/api/open-folder", {
     method: "POST",
     headers: { "Content-Type": "application/json" },
@@ -677,14 +877,35 @@ function initLogResizer() {
   fileTreeEl.addEventListener("contextmenu", (event) => {
     if (event.target !== fileTreeEl) return;
     event.preventDefault();
-    showContextMenu(event.clientX, event.clientY, [{ label: "New File", action: () => createFileIn("") }]);
+    showContextMenu(event.clientX, event.clientY, [
+      { label: "New File", action: () => createFileIn("") },
+      { label: "New Folder", action: () => createFolderIn("") },
+    ]);
   });
   initResizer();
   initLogResizer();
   window.addEventListener("keydown", (event) => {
-    if ((event.ctrlKey || event.metaKey) && event.key.toLowerCase() === "s") {
+    const mod = event.ctrlKey || event.metaKey;
+    if (!mod) return;
+
+    if (event.key.toLowerCase() === "s") {
       event.preventDefault();
       compile();
+      return;
+    }
+
+    // Leave native inputs (dialogs, the raw log box, settings fields) to
+    // their own browser-level undo/redo — this is only for the CM6 editor.
+    const inNativeInput = document.activeElement && ["INPUT", "TEXTAREA"].includes(document.activeElement.tagName);
+    if (inNativeInput) return;
+
+    const key = event.key.toLowerCase();
+    if (key === "z" && !event.shiftKey) {
+      event.preventDefault();
+      undo(view);
+    } else if (key === "y" || (key === "z" && event.shiftKey)) {
+      event.preventDefault();
+      redo(view);
     }
   });
   connectStatusSocket();

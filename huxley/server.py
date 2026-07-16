@@ -6,23 +6,20 @@ from dataclasses import asdict
 from pathlib import Path
 
 import httpx
-from fastapi import FastAPI, HTTPException, WebSocket, WebSocketDisconnect
-from fastapi.responses import FileResponse
+from fastapi import FastAPI, HTTPException, Request, WebSocket, WebSocketDisconnect
+from fastapi.responses import FileResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
-from watchfiles import DefaultFilter, awatch
 
 from huxley import ai
 from huxley import settings as settings_store
 from huxley.compiler import compile_tex
+from huxley.ghost_context import build_context, build_prompt
 from huxley.grammar import check_text
 from huxley.log_parser import Diagnostic, parse_log
 from huxley.synctex import forward_search, inverse_search
 
 WEB_DIR = Path(__file__).resolve().parent.parent / "web"
-
-# Source extensions that should trigger a recompile when changed on disk.
-SOURCE_EXTENSIONS = {".tex", ".bib", ".sty", ".cls", ".bst"}
 
 app = FastAPI()
 app.mount("/static", StaticFiles(directory=WEB_DIR), name="static")
@@ -32,14 +29,8 @@ app.mount("/static", StaticFiles(directory=WEB_DIR), name="static")
 # changes when the project root changes, never just from browsing/viewing a file.
 state: dict[str, Path | None] = {"root": None, "main_file": None}
 
-_watch_task: asyncio.Task | None = None
 _compile_lock = asyncio.Lock()
 _sockets: set[WebSocket] = set()
-
-
-class WatchFilter(DefaultFilter):
-    def __init__(self):
-        super().__init__(ignore_dirs=(*DefaultFilter.ignore_dirs, "build"))
 
 
 def _resolve_in_root(rel_path: str) -> Path:
@@ -74,8 +65,8 @@ def _relativize(diagnostic: Diagnostic, compile_dir: Path, root: Path) -> Diagno
     try:
         relative = (compile_dir / diagnostic.file).resolve().relative_to(root)
     except ValueError:
-        return Diagnostic(diagnostic.severity, None, diagnostic.line, diagnostic.message)
-    return Diagnostic(diagnostic.severity, str(relative), diagnostic.line, diagnostic.message)
+        return Diagnostic(diagnostic.severity, None, diagnostic.line, diagnostic.message, diagnostic.context)
+    return Diagnostic(diagnostic.severity, str(relative), diagnostic.line, diagnostic.message, diagnostic.context)
 
 
 async def _compile_and_broadcast():
@@ -96,19 +87,10 @@ async def _compile_and_broadcast():
         })
 
 
-async def _watch_root(root: Path):
-    async for changes in awatch(root, watch_filter=WatchFilter(), debounce=400):
-        if any(Path(path).suffix in SOURCE_EXTENSIONS for _change, path in changes):
-            await _compile_and_broadcast()
-
-
 def set_root(root: Path):
-    global _watch_task
     state["root"] = root
     state["main_file"] = find_initial_tex(root)
-    if _watch_task is not None:
-        _watch_task.cancel()
-    _watch_task = asyncio.get_running_loop().create_task(_watch_root(root))
+    settings_store.save_settings({"last_root": str(root)})
 
 
 @app.on_event("startup")
@@ -256,6 +238,15 @@ def create_file(body: CreateFileBody):
     return {"path": body.path}
 
 
+@app.post("/api/folder/create")
+def create_folder(body: CreateFileBody):
+    new_path = _resolve_in_root(body.path)
+    if new_path.exists():
+        raise HTTPException(409, "A file or folder with that name already exists")
+    new_path.mkdir(parents=True)
+    return {"path": body.path}
+
+
 @app.post("/api/file/rename")
 def rename_file(body: RenameBody):
     new_name = body.new_name.strip()
@@ -373,18 +364,27 @@ async def ai_explain(body: ExplainBody):
 
 
 @app.post("/api/ai/complete")
-async def ai_complete(body: CompleteBody):
+async def ai_complete(body: CompleteBody, request: Request):
     settings = settings_store.load_settings()
-    if not settings["autocomplete_enabled"]:
-        return {"completion": ""}
     model = settings["autocomplete_model"] or settings["chat_model"]
-    if not model:
-        return {"completion": ""}
-    try:
-        completion = await ai.ghost_completion(settings["ai_base_url"], model, body.prefix, body.suffix)
-    except httpx.HTTPError:
-        return {"completion": ""}
-    return {"completion": completion}
+    if not settings["autocomplete_enabled"] or not model:
+        return StreamingResponse(iter(()), media_type="text/plain")
+
+    main_file = state["main_file"]
+    main_text = main_file.read_text() if main_file is not None and main_file.exists() else None
+    context = build_context(main_text, body.prefix, body.suffix)
+    prompt = build_prompt(context, use_suffix=True)
+
+    async def stream():
+        try:
+            async for delta in ai.stream_ghost_completion(settings["ai_base_url"], model, prompt):
+                if await request.is_disconnected():
+                    break
+                yield delta
+        except httpx.HTTPError:
+            return
+
+    return StreamingResponse(stream(), media_type="text/plain")
 
 
 @app.post("/api/ai/improve")

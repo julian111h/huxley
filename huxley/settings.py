@@ -11,6 +11,7 @@ DEFAULTS = {
     "autocomplete_enabled": True,
     "grammar_enabled": True,
     "grammar_language": "en-US",
+    "last_root": "",
 }
 
 

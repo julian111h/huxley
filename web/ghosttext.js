@@ -19,6 +19,14 @@ class GhostWidget extends WidgetType {
 const setGhost = StateEffect.define();
 const EMPTY = { pos: -1, text: "", deco: Decoration.none };
 
+function withGhost(pos, text) {
+  return {
+    pos,
+    text,
+    deco: Decoration.set([Decoration.widget({ widget: new GhostWidget(text), side: 1 }).range(pos)]),
+  };
+}
+
 export const ghostField = StateField.define({
   create() {
     return EMPTY;
@@ -27,15 +35,30 @@ export const ghostField = StateField.define({
     for (const effect of tr.effects) {
       if (effect.is(setGhost)) {
         const { pos, text } = effect.value;
-        if (!text) return EMPTY;
-        return {
-          pos,
-          text,
-          deco: Decoration.set([Decoration.widget({ widget: new GhostWidget(text), side: 1 }).range(pos)]),
-        };
+        return text ? withGhost(pos, text) : EMPTY;
       }
     }
-    if (tr.docChanged || tr.selection) return EMPTY;
+    if (tr.docChanged) {
+      // If the user just typed exactly what the ghost text starts with,
+      // shrink it and keep showing the remainder — rather than discarding
+      // the suggestion on every keystroke — so it reads as "typing through"
+      // the completion. Any other edit (including a non-matching keystroke)
+      // invalidates it.
+      if (value.text) {
+        let consumed = null;
+        tr.changes.iterChanges((fromA, toA, fromB, toB, inserted) => {
+          if (consumed !== null || fromA !== toA || fromA !== value.pos) return;
+          const typed = inserted.toString();
+          if (typed && value.text.startsWith(typed)) consumed = typed;
+        });
+        if (consumed) {
+          const remaining = value.text.slice(consumed.length);
+          if (remaining) return withGhost(value.pos + consumed.length, remaining);
+        }
+      }
+      return EMPTY;
+    }
+    if (tr.selection) return EMPTY;
     return value;
   },
   provide: (field) => EditorView.decorations.from(field, (v) => v.deco),
