@@ -1,6 +1,6 @@
 # Huxley.
 
-> A fast, local-first LaTeX editor with live PDF preview, SyncTeX, and optional local AI.
+> A fast, local LaTeX editor with live PDF preview, SyncTeX, and optional local AI.
 
 <p align="center">
   <img src="sample/figures/20260711_155419.png" width="1000" alt="Huxley screenshot">
