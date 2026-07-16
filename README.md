@@ -1,11 +1,10 @@
 # Huxley.
 
-A local, desktop LaTeX editor built as a replacement for Overleaf — no compile
-timeouts, no cloud, no telemetry. Everything runs on your machine, including
-the optional AI features, which talk only to a local model server you point
-it at (e.g. [Ollama](https://ollama.com)).
+> A fast, local-first LaTeX editor with live PDF preview, SyncTeX, and optional local AI.
 
-![Screenshot](samples/figures/20260711_155419.png)
+<p align="center">
+  <img src="sample/figures/20260711_155419.png" width="1000" alt="Huxley screenshot">
+</p>
 
 ## Features
 
